@@ -1,83 +1,75 @@
-# app/api/registration_router.py
-
 from fastapi import APIRouter, HTTPException
 from pathlib import Path
-import random, json, hashlib, hmac, base64
+import random, json, hashlib, hmac
 from typing import List
 import time
-from app.core.ecc import rsc, BYTES, NSYM 
 router = APIRouter()
-
-SETUP_PATH      = Path("app/data/setup_data.json")
-REG_PATH        = Path("app/data/registration_data.json")
-SMARTCARD_PATH  = Path("app/data/smart_card.json")
-
+SETUP      = Path("app/data/setup.json")
+REG_DB     = Path("app/data/reg_db.json")
+SMARTCARD  = Path("app/data/card.json")
 
 def bits_to_bytes(bits: List[int]) -> bytes:
     ba = bytearray()
-    for i in range(0, len(bits), 8):
-        ba.append(int("".join(str(b) for b in bits[i:i+8]), 2))
+    for i in range(0,len(bits),8):
+        ba.append(int("".join(str(b) for b in bits[i:i+8]),2))
     return bytes(ba)
 
-def generate_noise(length:int, eta:float)->List[int]:
-    return [1 if random.random()<eta else 0 for _ in range(length)]
-
 @router.post("/register")
-async def register(user_data: dict):
+async def register(data: dict):
     # load params
-    if not SETUP_PATH.exists(): raise HTTPException(500,"No setup")
-    setup = json.loads(SETUP_PATH.read_text())
-    n,m,eta = setup["n"],setup["m"],setup["eta"]
-    A, mk  = setup["A"], setup["mk"]
+    if not SETUP.exists():
+        raise HTTPException(500, "Not initialized")
+    setup = json.loads(SETUP.read_text())
+    n,m,eta = setup["n"], setup["m"], setup["eta"]
+    A, mk, pk = setup["A"], setup["mk"], setup["pk"]
 
-    ID_i = user_data.get("ID_i")
-    B_i  = user_data.get("B_i")
+    # user input
+    ID_i = data.get("ID_i")
+    B_i  = data.get("B_i")
     if not ID_i or not isinstance(B_i,list) or len(B_i)!=384:
-        raise HTTPException(400,"Need ID_i + 384‑bit B_i")
-    t1=time.perf_counter()
+        raise HTTPException(400,"Need ID_i + 384-bit B_i")
+
     # pad biometric
+    t1=time.perf_counter()
     x_r = B_i + [0]*(512-384)
 
-    # 1) pick r (16 bytes) + store its hash
-    r = random.randbytes(BYTES)           # <- 64 bytes, not 16
-    h_r = hashlib.sha3_256(r).digest()
+    # generate key & nonce
+    k_i = [random.getrandbits(1) for _ in range(128)]
+    N   = [random.getrandbits(1) for _ in range(128)]
+    c_i = hashlib.sha3_256(bits_to_bytes(k_i+N)).digest()
 
-    # 2) ECC‑encode r → cw (64+NSYM bytes)
-    cw     = rsc.encode(r)
-
-    # 3) build helper_data = cw ⊕ ( data_bytes ∥ 0^NSYM )
-    data_bytes = bits_to_bytes(x_r)  # using only biometric here
-    pad        = b"\x00"*NSYM
-    padded     = data_bytes + pad    # length=64+NSYM
-    hd_bytes   = bytes(cw_byte ^ padded[i] for i,cw_byte in enumerate(cw))
-
-    # 4) LPN mask: pick v_i,e → beta
+    # sample v,e
     v_i = [random.getrandbits(1) for _ in range(n)]
-    e   = generate_noise(m,eta)
-    w   = [sum(A[i][j]&v_i[j] for j in range(n))&1 for i in range(m)]
-    beta= [(w[i]^e[i]^(x_r[i])) for i in range(m)]
+    e   = [1 if random.random()<eta else 0 for _ in range(m)]
 
-    # 5) HMAC under h_r
-    mac = hmac.new(h_r,digestmod=hashlib.sha3_256)
-    mac.update(ID_i.encode()); mac.update(bits_to_bytes(beta))
-    sigma = mac.digest()
+    # compute w and β
+    w_i    = [sum(A[i][j]&v_i[j] for j in range(n))&1 for i in range(m)]
+    b_bits = x_r + k_i
+    beta_r = [(w_i[i]^e[i]^b_bits[i]) for i in range(m)]
+
+    # r_i, Z_i, δ_i, e_i
+    r_i    = hashlib.sha3_256(c_i + bits_to_bytes(beta_r)).digest()
+    Z_i    = [(w_i[i]^pk[i]) for i in range(m)]
+    h_wi   = hashlib.sha3_256(bits_to_bytes(w_i)).digest()
+    h_IDr  = hashlib.sha3_256(ID_i.encode()+r_i).digest()
+    delta  = bytes(a^b for a,b in zip(h_wi,h_IDr))
+    h_IDmk = hashlib.sha3_256(ID_i.encode()+bits_to_bytes(mk)).digest()
+    e_i = hmac.new(
+        key=bits_to_bytes(mk),
+        msg=ID_i.encode() + r_i,
+        digestmod=hashlib.sha3_256
+    ).digest()
     t2=time.perf_counter()
-
     T=t2-t1
     print(f"Time for registration:{T:.6f} seconds")
-    # 6) persist server record
-    REG_PATH.write_text(json.dumps({
-        "ID_i":   ID_i,
-        "beta":   beta,
-        "h_r":    h_r.hex(),
-        "sigma":  sigma.hex()
+    # store server record and card blob
+    REG_DB.write_text(json.dumps({
+        "ID_i": ID_i, "beta_r": beta_r,"c_i":   c_i.hex(), "r_i": r_i.hex(),
+        "Z_i": Z_i, "delta": delta.hex()
+    }, indent=2))
+    SMARTCARD.write_text(json.dumps({
+        "v_i": v_i, "e": e, "w_i": w_i,
+        "beta_r": beta_r, "k_i": k_i, "N": N,"e_i":e_i.hex()
     }, indent=2))
 
-    # 7) persist smart‑card blob
-    SMARTCARD_PATH.write_text(json.dumps({
-        "v_i":     v_i,
-        "N_hex":   random.randbytes(16).hex(),
-        "HD_b64":  base64.b64encode(hd_bytes).decode()
-    }, indent=2))
-
-    return {"message":"Registration OK"}
+    return {"message":"Registered"}
